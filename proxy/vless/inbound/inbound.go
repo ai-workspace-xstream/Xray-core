@@ -538,14 +538,15 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	inbound.Name = "vless"
 	inbound.User = request.User
 	inbound.VlessRoute = net.PortFromBytes(userSentID[6:8])
+	account := request.User.Account.(*vless.MemoryAccount)
 	ctx, authSpan := otel.Tracer("github.com/xtls/xray-core/proxy/vless/inbound").Start(ctx, "xconnect.server.vless.authenticated")
 	authSpan.SetAttributes(
 		attribute.String("xconnect.proxy.protocol", "vless"),
-		attribute.String("xconnect.identity.status", "unresolved"),
+		attribute.String("xconnect.identity.status", "resolved"),
+		attribute.String("xconnect.proxy_identity_ref", proxyIdentityRef(account.ID.String())),
+		attribute.Int("xconnect.identity.ref_version", 1),
 	)
 	authSpan.End()
-
-	account := request.User.Account.(*vless.MemoryAccount)
 
 	if account.Reverse != nil && request.Command != protocol.RequestCommandRvs {
 		return errors.New("for safety reasons, user " + account.ID.String() + " is not allowed to use forward proxy")
