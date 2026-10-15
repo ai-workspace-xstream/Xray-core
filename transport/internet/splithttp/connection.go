@@ -4,15 +4,20 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 type splitConn struct {
-	writer     io.WriteCloser
-	reader     io.ReadCloser
-	remoteAddr net.Addr
-	localAddr  net.Addr
-	onClose    func()
+	writer      io.WriteCloser
+	reader      io.ReadCloser
+	remoteAddr  net.Addr
+	localAddr   net.Addr
+	onClose     func()
+	spanContext trace.SpanContext
 }
+
+func (c *splitConn) OpenTelemetrySpanContext() trace.SpanContext { return c.spanContext }
 
 func (c *splitConn) Write(b []byte) (int, error) {
 	return c.writer.Write(b)

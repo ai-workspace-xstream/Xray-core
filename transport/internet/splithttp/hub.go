@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -31,6 +32,11 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type requestHandler struct {
@@ -94,6 +100,36 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 }
 
 func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	ctx := otel.GetTextMapPropagator().Extract(request.Context(), propagation.HeaderCarrier(request.Header))
+	traceRequest := request.Method != "POST"
+	if strings.HasPrefix(request.URL.Path, h.path) {
+		sessionId, seqStr := h.config.ExtractMetaFromRequest(request, h.path)
+		if request.Method == "POST" {
+			traceRequest = sessionId == "" || seqStr == ""
+		}
+	}
+	span := trace.SpanFromContext(ctx)
+	if traceRequest {
+		ctx, span = otel.Tracer("github.com/xtls/xray-core/transport/internet/splithttp").Start(
+			ctx, "xconnect.server.xhttp.request", trace.WithSpanKind(trace.SpanKindServer),
+		)
+	}
+	var spanEnded atomic.Bool
+	endSpan := func() {
+		if spanEnded.CompareAndSwap(false, true) {
+			span.End()
+		}
+	}
+	defer endSpan()
+	request = request.WithContext(ctx)
+	if traceRequest {
+		span.SetAttributes(
+			attribute.String("http.request.method", request.Method),
+			attribute.String("network.protocol.version", request.Proto),
+			attribute.String("xconnect.transport", "xhttp"),
+		)
+	}
+	writer = &traceResponseWriter{ResponseWriter: writer, span: span}
 	if len(h.host) > 0 && !internet.IsValidHTTPHost(request.Host, h.host) {
 		errors.LogInfo(context.Background(), "failed to validate host, request:", request.Host, ", config:", h.host)
 		writer.WriteHeader(http.StatusNotFound)
@@ -105,6 +141,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
+	sessionId, seqStr := h.config.ExtractMetaFromRequest(request, h.path)
 
 	h.config.WriteResponseHeader(writer, request.Method, request.Header)
 	length := int(h.config.GetNormalizedXPaddingBytes().rand())
@@ -148,8 +185,6 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	obfsPaddingAccepted := h.config.XPaddingObfsMode && paddingValue != ""
-
-	sessionId, seqStr := h.config.ExtractMetaFromRequest(request, h.path)
 
 	if sessionId == "" && h.config.Mode != "" && h.config.Mode != "auto" && h.config.Mode != "stream-one" && h.config.Mode != "stream-up" {
 		errors.LogInfo(context.Background(), "stream-one mode is not allowed")
@@ -368,6 +403,8 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		writer.WriteHeader(http.StatusOK)
 		writer.(http.Flusher).Flush()
+		span.AddEvent("xconnect.xhttp.headers_flushed")
+		endSpan() // The downstream stream may remain open for hours; this span measures setup only.
 
 		httpSC := &httpServerConn{
 			Instance:       done.New(),
@@ -379,10 +416,11 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			localAddr = la
 		}
 		conn := splitConn{
-			writer:     httpSC,
-			reader:     httpSC,
-			remoteAddr: remoteAddr,
-			localAddr:  localAddr,
+			writer:      httpSC,
+			reader:      httpSC,
+			remoteAddr:  remoteAddr,
+			localAddr:   localAddr,
+			spanContext: trace.SpanContextFromContext(request.Context()),
 		}
 		if sessionId != "" { // if not stream-one
 			conn.reader = currentSession.uploadQueue
@@ -402,6 +440,39 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
+
+type traceResponseWriter struct {
+	http.ResponseWriter
+	span   trace.Span
+	status int
+}
+
+func (w *traceResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.span.SetAttributes(attribute.Int("http.response.status_code", status))
+	if status >= http.StatusInternalServerError {
+		w.span.SetStatus(codes.Error, "XHTTP request failed")
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *traceResponseWriter) Write(payload []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(payload)
+}
+
+func (w *traceResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *traceResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 type httpServerConn struct {
 	sync.Mutex

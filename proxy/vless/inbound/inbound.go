@@ -43,6 +43,8 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 func init() {
@@ -536,6 +538,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	inbound.Name = "vless"
 	inbound.User = request.User
 	inbound.VlessRoute = net.PortFromBytes(userSentID[6:8])
+	ctx, authSpan := otel.Tracer("github.com/xtls/xray-core/proxy/vless/inbound").Start(ctx, "xconnect.server.vless.authenticated")
+	authSpan.SetAttributes(
+		attribute.String("xconnect.proxy.protocol", "vless"),
+		attribute.String("xconnect.identity.status", "unresolved"),
+	)
+	authSpan.End()
 
 	account := request.User.Account.(*vless.MemoryAccount)
 

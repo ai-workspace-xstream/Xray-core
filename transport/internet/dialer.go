@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/dice"
@@ -16,6 +17,10 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/pipe"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Dialer is the interface for dialing outbound connections.
@@ -224,6 +229,30 @@ func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt
 
 // DialSystem calls system dialer to create a network connection.
 func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
+	ctx, span := otel.Tracer("github.com/xtls/xray-core/transport/internet").Start(
+		ctx, "xconnect.server.outbound.dial", trace.WithSpanKind(trace.SpanKindClient),
+	)
+	started := time.Now()
+	defer func() {
+		span.SetAttributes(attribute.Int64("xconnect.outbound.dial.duration_ms", time.Since(started).Milliseconds()))
+		span.End()
+	}()
+	network := "unknown"
+	if dest.Network == net.Network_TCP {
+		network = "tcp"
+	} else if dest.Network == net.Network_UDP {
+		network = "udp"
+	}
+	span.SetAttributes(attribute.String("network.transport", network))
+	conn, err := dialSystem(ctx, dest, sockopt)
+	if err != nil {
+		span.RecordError(fmt.Errorf("outbound dial failed"))
+		span.SetStatus(codes.Error, "outbound dial failed")
+	}
+	return conn, err
+}
+
+func dialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
 	var src net.Address
 	outbounds := session.OutboundsFromContext(ctx)
 	var outboundName string
@@ -253,7 +282,16 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		if outboundName == "freedom" && dest.Network == net.Network_UDP && origTargetAddr != nil && src == nil {
 			finalStrategy = finalStrategy.GetDynamicStrategy(origTargetAddr.Family())
 		}
+		dnsCtx, dnsSpan := otel.Tracer("github.com/xtls/xray-core/transport/internet").Start(ctx, "xconnect.server.outbound.dns_lookup", trace.WithSpanKind(trace.SpanKindClient))
+		dnsStarted := time.Now()
 		ips, err := LookupForIP(dest.Address.Domain(), finalStrategy, src)
+		dnsSpan.SetAttributes(attribute.Int64("xconnect.outbound.dns.duration_ms", time.Since(dnsStarted).Milliseconds()))
+		if err != nil {
+			dnsSpan.RecordError(fmt.Errorf("outbound DNS lookup failed"))
+			dnsSpan.SetStatus(codes.Error, "outbound DNS lookup failed")
+		}
+		dnsSpan.End()
+		ctx = dnsCtx
 		if err != nil {
 			errors.LogErrorInner(ctx, err, "failed to resolve ip")
 			if sockopt.DomainStrategy.ForceIP() {
