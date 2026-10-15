@@ -25,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tcp"
 	"github.com/xtls/xray-core/transport/internet/udp"
 	"github.com/xtls/xray-core/transport/pipe"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type worker interface {
@@ -60,6 +61,11 @@ func getTProxyType(s *internet.MemoryStreamConfig) internet.SocketConfig_TProxyM
 
 func (w *tcpWorker) callback(conn stat.Connection) {
 	ctx, cancel := context.WithCancel(w.ctx)
+	if carrier, ok := conn.(interface{ OpenTelemetrySpanContext() trace.SpanContext }); ok {
+		if spanContext := carrier.OpenTelemetrySpanContext(); spanContext.IsValid() {
+			ctx = trace.ContextWithRemoteSpanContext(ctx, spanContext)
+		}
+	}
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
 
